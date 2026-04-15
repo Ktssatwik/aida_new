@@ -1,0 +1,730 @@
+AI DATA ANALYST APP - DETAILED PIPELINE (NO ML, PHASE 1)
+=========================================================
+
+Project Goal
+------------
+Build a full-stack AI-powered data analyst app where a user can:
+1) Upload a CSV file
+2) Store it in MySQL
+3) Ask questions in natural language
+4) Get generated SQL
+5) Optionally execute the SQL and view results
+
+Important Rule
+--------------
+For EVERY uploaded CSV, create a NEW table inside MySQL.
+Do not append different CSV files into one shared data table.
+
+
+1. SYSTEM FLOW (HIGH LEVEL)
+---------------------------
+React UI
+  -> FastAPI backend
+  -> CSV pipeline OR NL query pipeline
+  -> MySQL (dataset tables + metadata tables)
+  -> LangChain + OpenAI (NL -> SQL generation)
+  -> FastAPI returns SQL (and result rows if executed)
+  -> React shows SQL + table output
+
+
+2. TECH STACK
+-------------
+Frontend:
+- React
+- Axios (API calls)
+- Optional table UI library (or plain table component)
+
+Backend:
+- FastAPI
+- Uvicorn
+- Pydantic
+- Pandas
+- SQLAlchemy
+- PyMySQL
+- LangChain
+- OpenAI API client (through LangChain model wrapper)
+
+Database:
+- MySQL server
+
+
+3. DATABASE DESIGN
+------------------
+Use one MySQL database (example: ai_analyst_db).
+
+3.1 Metadata table: dataset_registry
+Purpose: Track every uploaded CSV and the table created for it.
+
+Suggested columns:
+- dataset_id (UUID or auto-increment primary key)
+- original_file_name (VARCHAR)
+- table_name (VARCHAR, unique)
+- uploaded_at (DATETIME)
+- row_count (INT)
+- column_schema_json (JSON or TEXT)
+- status (VARCHAR, e.g. active/failed)
+
+3.2 Metadata table: query_logs
+Purpose: Store NL prompts and generated SQL for traceability.
+
+Suggested columns:
+- query_id (UUID or auto-increment primary key)
+- dataset_id (FK to dataset_registry)
+- question_text (TEXT)
+- generated_sql (TEXT)
+- is_safe_sql (BOOLEAN)
+- execution_status (VARCHAR)
+- error_message (TEXT, nullable)
+- created_at (DATETIME)
+
+3.3 Data tables (dynamic)
+Each CSV upload creates one new table:
+- Naming format example: ds_<yyyyMMdd_HHmmss>_<sanitized_filename>
+- Example: ds_20260413_160501_sales_data
+
+
+4. BACKEND MODULE STRUCTURE
+---------------------------
+Suggested backend folders/files:
+
+backend/
+  app/
+    main.py
+    core/
+      config.py
+      database.py
+      security.py
+    models/
+      registry_models.py
+    schemas/
+      dataset_schemas.py
+      query_schemas.py
+    services/
+      csv_service.py
+      sql_service.py
+      llm_service.py
+      validator_service.py
+    api/
+      dataset_routes.py
+      query_routes.py
+
+
+5. ENVIRONMENT VARIABLES
+------------------------
+Store in .env:
+- MYSQL_HOST
+- MYSQL_PORT
+- MYSQL_DATABASE
+- MYSQL_USER
+- MYSQL_PASSWORD
+- OPENAI_API_KEY
+- OPENAI_MODEL (example: gpt-4.1-mini or chosen model)
+
+Backend should fail fast at startup if required env vars are missing.
+
+
+6. PHASE 1 IMPLEMENTATION ORDER (SIMPLE + SAFE)
+-----------------------------------------------
+Step 1: Setup FastAPI + DB connection
+- Create SQLAlchemy engine for MySQL.
+- Add health endpoint: GET /health
+- Confirm backend can connect to DB.
+
+Step 2: Create metadata tables
+- Create dataset_registry and query_logs.
+- Run startup migration/init script.
+
+Step 3: CSV upload API
+- Endpoint: POST /datasets/upload
+- Input: CSV file
+- Logic:
+  1) Validate file extension is .csv
+  2) Read CSV via pandas
+  3) Enforce max rows (<= 20000)
+  4) Clean/normalize column names (snake_case, unique)
+  5) Infer data types
+  6) Generate unique table name
+  7) Create NEW MySQL table for this CSV
+  8) Insert all rows into that new table
+  9) Store upload info in dataset_registry
+  10) Return dataset_id + table_name + column list + row_count
+
+Step 4: Dataset list API
+- Endpoint: GET /datasets
+- Return all uploaded datasets with table_name and uploaded_at.
+
+Step 5: Basic SQL execution API (manual)
+- Endpoint: POST /query/sql/execute
+- Input: dataset_id + SQL string
+- Only for testing initial DB query pipeline.
+- Pass SQL through safety validator before execution.
+
+Step 6: NL -> SQL API (LangChain)
+- Endpoint: POST /query/nl-to-sql
+- Input: dataset_id + question
+- Flow:
+  1) Load table schema for selected dataset
+  2) Build strict prompt with schema context
+  3) Ask LLM to generate SQL only
+  4) Validate generated SQL (read-only rules)
+  5) Return SQL text
+  6) Log prompt + SQL in query_logs
+
+Step 7: NL query execute API (combined)
+- Endpoint: POST /query/nl-to-sql/execute
+- Input: dataset_id + question
+- Flow:
+  1) Generate SQL from NL
+  2) Validate SQL
+  3) Execute SQL
+  4) Return SQL + columns + rows + row_count
+  5) Log success/failure
+
+
+7. CSV -> MYSQL PIPELINE DETAILS
+--------------------------------
+7.1 Validation
+- Reject non-CSV files
+- Reject empty files
+- Reject CSV > 20000 rows
+- Handle encoding issues (try utf-8, fallback logic)
+
+7.2 Column sanitization rules
+- Lowercase
+- Replace spaces/special chars with underscore
+- Ensure no duplicate names after sanitization
+- Ensure names do not start with digits
+
+7.3 Type handling (basic)
+- Detect numeric, datetime, boolean, text
+- Keep unknown columns as text
+- Fill NaN carefully (or keep as NULL)
+
+7.4 Table creation
+- Always create brand-new table per upload
+- Never overwrite old dataset tables
+- Use transaction when inserting data
+- Rollback and mark failed status on errors
+
+7.5 Registry record
+- Store:
+  original file name
+  generated table name
+  row count
+  JSON schema (column/type map)
+
+
+8. NL -> SQL PROMPTING STRATEGY
+-------------------------------
+Prompt should include:
+- Database dialect = MySQL
+- Allowed table = selected table_name only
+- Available columns with types
+- Hard rule: generate SELECT query only
+- Hard rule: add LIMIT if user did not specify one
+- Output format: SQL only (no markdown)
+
+Example instruction block:
+"You are a MySQL SQL generator. Use ONLY table <table_name>.
+Generate ONE read-only SQL query for this question.
+Do not use INSERT/UPDATE/DELETE/DDL.
+Return SQL only."
+
+
+9. SQL SAFETY LAYER (MANDATORY)
+-------------------------------
+Before execution, enforce:
+- Must start with SELECT or WITH
+- No semicolon-separated multi-statement execution
+- Block keywords:
+  INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, CREATE, GRANT, REVOKE
+- Optionally block joins to unknown tables
+- Enforce LIMIT (for example max 200 rows by default)
+
+If query fails safety check:
+- Return error response with reason
+- Log unsafe attempt in query_logs
+
+
+10. API CONTRACT (SUGGESTED)
+----------------------------
+10.1 POST /datasets/upload
+Response example:
+{
+  "dataset_id": "b0b4d7f3-...",
+  "table_name": "ds_20260413_160501_sales_data",
+  "row_count": 12844,
+  "columns": [
+    {"name": "customer_id", "dtype": "int"},
+    {"name": "revenue", "dtype": "float"}
+  ]
+}
+
+10.2 GET /datasets
+Response example:
+[
+  {
+    "dataset_id": "b0b4d7f3-...",
+    "file_name": "sales_data.csv",
+    "table_name": "ds_20260413_160501_sales_data",
+    "uploaded_at": "2026-04-13T16:05:01"
+  }
+]
+
+10.3 POST /query/nl-to-sql
+Request:
+{
+  "dataset_id": "b0b4d7f3-...",
+  "question": "Top 5 customers by revenue"
+}
+Response:
+{
+  "generated_sql": "SELECT customer_id, SUM(revenue) AS total_revenue FROM ds_20260413_160501_sales_data GROUP BY customer_id ORDER BY total_revenue DESC LIMIT 5;"
+}
+
+10.4 POST /query/nl-to-sql/execute
+Response:
+{
+  "generated_sql": "...",
+  "columns": ["customer_id", "total_revenue"],
+  "rows": [
+    [101, 25000.4],
+    [205, 24011.0]
+  ],
+  "row_count": 5
+}
+
+
+11. FRONTEND FLOW (REACT)
+-------------------------
+Page 1: Dataset Upload
+- File input + upload button
+- Show uploaded datasets list
+
+Page 2: Ask Data Question
+- Dataset selector dropdown
+- Text input for NL question
+- "Generate SQL" button
+- Show generated SQL in code block
+- "Run Query" button (optional if using combined endpoint)
+- Show result table
+
+Minimum state needed:
+- selectedDatasetId
+- questionText
+- generatedSql
+- queryResult
+- loading/error states
+
+
+12. ERROR HANDLING CHECKLIST
+----------------------------
+Upload errors:
+- Invalid file type
+- CSV parsing error
+- Row limit exceeded
+- DB table creation failure
+
+Query errors:
+- Dataset not found
+- Schema fetch error
+- LLM timeout/error
+- Unsafe SQL blocked
+- SQL execution error
+
+Return structured JSON errors with code + message.
+
+
+13. TESTING CHECKLIST (PHASE 1)
+-------------------------------
+Backend:
+- Upload small valid CSV
+- Upload malformed CSV
+- Upload >20000 rows CSV
+- Verify new table created per upload
+- Verify registry entry exists for each upload
+- NL question generates SQL
+- Unsafe SQL gets blocked
+- Safe SQL executes and returns rows
+
+Frontend:
+- Upload flow works
+- Dataset selector loads data
+- NL query to SQL display works
+- Execute query and show table
+
+
+14. PHASE 1 DEFINITION OF DONE
+------------------------------
+Phase 1 is complete when:
+1) User uploads a CSV and backend creates a NEW MySQL table.
+2) Upload is visible in dataset_registry (and GET /datasets).
+3) User asks a natural language question for selected dataset.
+4) App returns generated SQL reliably.
+5) SQL can be safely executed and results are shown in UI.
+
+
+15. WHAT IS EXPLICITLY OUT OF SCOPE FOR NOW
+-------------------------------------------
+- Machine learning (regression/classification/clustering)
+- Authentication and multi-user isolation
+- Advanced chart intelligence
+- Persistent conversation memory
+- Production deployment hardening
+
+
+16. EXECUTION PHASES TO FOLLOW (STEP-BY-STEP)
+---------------------------------------------
+Follow these phases in sequence.
+Do not jump ahead until the current phase is stable.
+
+Phase 0: Project Bootstrap
+Goal:
+- Prepare local environment and base project structure.
+
+Steps:
+1) Create backend and frontend folders.
+2) Create virtual environment and install backend dependencies.
+3) Initialize React app and install Axios.
+4) Configure .env for MySQL and OpenAI key.
+5) Add a simple health-check API.
+
+Deliverable:
+- FastAPI server and React app both run successfully.
+- Backend can start without errors.
+
+Exit Criteria:
+- `GET /health` works from browser/Postman.
+
+
+Phase 1: Database Foundation
+Goal:
+- Ensure backend can talk to MySQL and metadata tracking works.
+
+Steps:
+1) Create SQLAlchemy database connection module.
+2) Create metadata tables: dataset_registry and query_logs.
+3) Add startup initialization for metadata tables.
+4) Verify inserts/reads into metadata tables.
+
+Deliverable:
+- MySQL connected and metadata tables operational.
+
+Exit Criteria:
+- You can insert and fetch one test registry record from backend.
+
+
+Phase 2: CSV Upload -> New Table Creation
+Goal:
+- Upload CSV and create a brand-new MySQL table for each file.
+
+Steps:
+1) Build POST /datasets/upload endpoint.
+2) Validate CSV file, row limit (<= 20000), and structure.
+3) Sanitize column names safely.
+4) Generate unique table name per upload.
+5) Write dataframe into new MySQL table.
+6) Save upload metadata in dataset_registry.
+
+Deliverable:
+- Each CSV upload creates a unique MySQL table and registry entry.
+
+Exit Criteria:
+- Upload 2 CSVs and see 2 separate data tables + 2 registry records.
+
+
+Phase 3: Dataset Management APIs
+Goal:
+- Make uploaded datasets discoverable in UI.
+
+Steps:
+1) Build GET /datasets endpoint.
+2) Return dataset_id, file_name, table_name, uploaded_at, row_count.
+3) Optional: Add GET /datasets/{dataset_id}/schema endpoint.
+
+Deliverable:
+- Frontend can fetch and show dataset list for user selection.
+
+Exit Criteria:
+- User can choose a dataset before asking queries.
+
+
+Phase 4: Safe SQL Execution Baseline (Manual SQL)
+Goal:
+- Build secure SQL execution foundation before NL layer.
+
+Steps:
+1) Build SQL validator service.
+2) Allow only SELECT/WITH queries.
+3) Block dangerous keywords and multi-statements.
+4) Add row limit enforcement.
+5) Build POST /query/sql/execute endpoint.
+
+Deliverable:
+- Safe SQL execution works with proper errors for unsafe SQL.
+
+Exit Criteria:
+- Valid SELECT works; UPDATE/DELETE/DROP are blocked.
+
+
+Phase 5: Natural Language -> SQL (LangChain)
+Goal:
+- Convert user question to safe SQL for selected dataset.
+
+Steps:
+1) Build llm_service with LangChain + model config.
+2) Build strict prompt template using selected table schema.
+3) Build POST /query/nl-to-sql endpoint.
+4) Validate generated SQL before returning it.
+5) Store question + SQL + status in query_logs.
+
+Deliverable:
+- User asks question and receives generated SQL.
+
+Exit Criteria:
+- At least 5 sample questions produce valid SQL for chosen table.
+
+
+Phase 6: NL Query Execution Endpoint
+Goal:
+- One endpoint to generate SQL and return data.
+
+Steps:
+1) Build POST /query/nl-to-sql/execute endpoint.
+2) Generate SQL from NL input.
+3) Validate SQL safety.
+4) Execute query.
+5) Return generated SQL + columns + rows + row_count.
+
+Deliverable:
+- End-to-end backend intelligence flow works.
+
+Exit Criteria:
+- User question returns both SQL and result table successfully.
+
+
+Phase 7: React Integration (MVP UI)
+Goal:
+- Connect full frontend flow to backend APIs.
+
+Steps:
+1) Build upload panel.
+2) Build dataset list + selector.
+3) Build NL input form.
+4) Show generated SQL response.
+5) Show query result table.
+6) Add loading and error states.
+
+Deliverable:
+- Complete user flow in browser from upload to query results.
+
+Exit Criteria:
+- Non-technical user can use app without Postman.
+
+
+Phase 8: Hardening and QA
+Goal:
+- Stabilize app and reduce runtime failures.
+
+Steps:
+1) Add structured API error responses.
+2) Add input validation and edge-case handling.
+3) Add backend logging for failures and slow queries.
+4) Run full test checklist (upload, query, safety, UI).
+5) Fix bugs and improve prompt robustness.
+
+Deliverable:
+- Reliable MVP ready for demo/use.
+
+Exit Criteria:
+- Core flows pass tests consistently on repeated runs.
+
+
+Phase 9: Optional Next Expansion (After MVP)
+Goal:
+- Extend product after stable NL-to-SQL base.
+
+Options:
+1) Add chart generation layer.
+2) Add explanation layer (LLM summary from query result).
+3) Add auth + user-based dataset isolation.
+4) Add ML layer later (regression/classification/etc).
+
+Deliverable:
+- Roadmap beyond MVP is clearly sequenced.
+
+
+Phase 10: Authentication Foundation (Backend + Database)
+Goal:
+- Prepare secure auth base for registration, login, OTP, and token flow.
+
+Steps:
+1) Create `users` table:
+   - id (PK)
+   - email (unique)
+   - password_hash
+   - is_verified
+   - created_at, updated_at
+2) Create `otp_verifications` table:
+   - id (PK)
+   - user_id (FK)
+   - otp_hash
+   - expires_at
+   - attempts_count
+   - is_used
+   - created_at
+3) Create `refresh_tokens` table:
+   - id (PK)
+   - user_id (FK)
+   - token_hash
+   - expires_at
+   - revoked_at
+   - created_at
+4) Add password hashing utility (bcrypt).
+5) Add JWT utility for access and refresh tokens.
+
+Deliverable:
+- Auth schema and crypto/token utilities are ready.
+
+Exit Criteria:
+- DB tables created and utility functions verified with test calls.
+
+
+Phase 11: Register + Gmail SMTP OTP Verification
+Goal:
+- Enable registration with email OTP verification.
+
+Steps:
+1) Build `POST /auth/register`:
+   - accept email + password
+   - hash password and create user
+   - create 4-digit OTP
+   - hash OTP and store in `otp_verifications`
+2) Send OTP email via Gmail SMTP (App Password) using environment variables.
+3) Build `POST /auth/verify-otp`:
+   - validate otp, expiry, attempts
+   - mark user as verified
+4) Build `POST /auth/resend-otp` with cooldown.
+5) Add OTP limits:
+   - OTP expiry (example: 5 minutes)
+   - max retry attempts (example: 5)
+   - resend cooldown (example: 30 seconds)
+
+Deliverable:
+- User can register and verify account using emailed OTP.
+
+Exit Criteria:
+- Verified user status changes only after correct OTP.
+
+
+Phase 12: Login, Access Token, Refresh Token, Logout
+Goal:
+- Implement complete token lifecycle for login/session management.
+
+Steps:
+1) Build `POST /auth/login`:
+   - validate credentials
+   - check verified user
+   - issue access token + refresh token
+   - store refresh token hash in DB
+2) Build `POST /auth/refresh`:
+   - validate existing refresh token
+   - rotate refresh token
+   - return new access token (+ new refresh token)
+3) Build `POST /auth/logout`:
+   - revoke refresh token in DB
+   - clear auth cookies/session state
+4) Add auth middleware/dependency:
+   - `get_current_user` from access token
+5) Ensure logout uses refresh token revocation flow.
+
+Deliverable:
+- Login/logout works with secure token-based sessions.
+
+Exit Criteria:
+- Logged-out refresh token cannot be used again.
+
+
+Phase 13: User-Scoped Dataset Isolation
+Goal:
+- Ensure each user can access only their own datasets.
+
+Steps:
+1) Add `user_id` column to `dataset_registry` (FK to users).
+2) On CSV upload:
+   - read current authenticated user
+   - save dataset with that `user_id`
+3) Update dataset endpoints:
+   - `GET /datasets` returns only current user datasets
+   - `GET /datasets/{dataset_id}/schema` checks ownership
+4) Update query endpoints:
+   - reject access if dataset does not belong to logged-in user
+   - return 403 for unauthorized access
+5) Add migration and backfill strategy for existing records.
+
+Deliverable:
+- Dataset visibility and query access are strictly user-specific.
+
+Exit Criteria:
+- User A cannot see or query User B datasets.
+
+
+Phase 14: Frontend Auth Routes + Protected Navigation + Better UI
+Goal:
+- Build clean auth UX and enforce route protection in React.
+
+Steps:
+1) Keep routes:
+   - `/login`
+   - `/register`
+   - `/aida` (main app page)
+2) Add OTP verification UI:
+   - register -> OTP input -> verify
+3) Connect frontend forms to auth APIs:
+   - register, verify-otp, login, refresh, logout
+4) Add protected route guard:
+   - if not logged in: block `/aida`, redirect to `/login`
+   - if logged in and user opens `/login`: redirect to `/aida`
+5) Enforce logout-only flow:
+   - use Logout button to terminate session and return `/login`
+6) Improve visual quality:
+   - polished auth cards
+   - better spacing, feedback messages, loading states
+   - consistent typography/colors
+
+Deliverable:
+- Smooth auth experience with strong route guard behavior.
+
+Exit Criteria:
+- App flow is secure and intuitive for non-technical users.
+
+
+Phase 15: Auth + Isolation Hardening and QA
+Goal:
+- Validate security and stability of the full authenticated workflow.
+
+Steps:
+1) Test OTP edge cases:
+   - expired OTP
+   - wrong OTP attempts
+   - reused OTP
+   - resend throttling
+2) Test token lifecycle:
+   - access token expiry
+   - refresh token rotation
+   - logout revocation
+3) Test isolation with 2 users:
+   - upload separate datasets
+   - verify no cross-user listing or query access
+4) Add structured logs for auth events:
+   - register/login/logout/verify failures
+5) Final UX QA:
+   - route redirects
+   - session persistence
+   - protected access checks
+
+Deliverable:
+- Reliable, demo-ready authenticated AI data analyst platform.
+
+Exit Criteria:
+- Repeated runs pass core auth, upload, query, and access-control flows.
