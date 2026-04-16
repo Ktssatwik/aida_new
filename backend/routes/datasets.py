@@ -11,7 +11,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import engine, get_db
-from models import DatasetRegistry
+from models import DatasetRegistry, User
+from services.auth_dependency import get_current_user
 
 router = APIRouter(tags=["datasets"])
 logger = logging.getLogger("aida_api.datasets")
@@ -57,7 +58,11 @@ def _generate_table_name(filename: str) -> str:
 
 
 @router.post("/datasets/upload")
-def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
+def upload_dataset(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Upload CSV, create a new MySQL table, and store metadata."""
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only CSV files are allowed.")
@@ -106,6 +111,7 @@ def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
     schema_map = {col: str(dtype) for col, dtype in df.dtypes.items()}
 
     record = DatasetRegistry(
+        user_id=current_user.id,
         dataset_id=dataset_id,
         original_file_name=file.filename,
         table_name=table_name,
@@ -132,10 +138,18 @@ def upload_dataset(file: UploadFile = File(...), db: Session = Depends(get_db)):
 
 
 @router.get("/datasets")
-def list_datasets(db: Session = Depends(get_db)):
+def list_datasets(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Return all uploaded datasets for UI selection."""
     try:
-        rows = db.query(DatasetRegistry).order_by(DatasetRegistry.uploaded_at.desc()).all()
+        rows = (
+            db.query(DatasetRegistry)
+            .filter(DatasetRegistry.user_id == current_user.id)
+            .order_by(DatasetRegistry.uploaded_at.desc())
+            .all()
+        )
     except SQLAlchemyError:
         logger.exception("Failed to fetch dataset list.")
         raise HTTPException(status_code=500, detail="Database connection error.")
@@ -154,7 +168,11 @@ def list_datasets(db: Session = Depends(get_db)):
 
 
 @router.get("/datasets/{dataset_id}/schema")
-def get_dataset_schema(dataset_id: str, db: Session = Depends(get_db)):
+def get_dataset_schema(
+    dataset_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Return metadata and schema for one dataset."""
     try:
         record = (
@@ -168,6 +186,8 @@ def get_dataset_schema(dataset_id: str, db: Session = Depends(get_db)):
 
     if not record:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+    if record.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this dataset.")
 
     try:
         schema = json.loads(record.column_schema_json) if record.column_schema_json else {}

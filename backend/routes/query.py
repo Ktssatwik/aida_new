@@ -6,7 +6,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import engine, get_db
-from models import DatasetRegistry
+from models import DatasetRegistry, User
+from services.auth_dependency import get_current_user
 from services.sql_validator import validate_sql_read_only
 
 from services.llm_service import generate_sql_from_prompt
@@ -20,7 +21,7 @@ router = APIRouter(tags=["query"])
 logger = logging.getLogger("aida_api.query")
 
 
-def _get_dataset_record(db: Session, dataset_id: str) -> DatasetRegistry:
+def _get_dataset_record(db: Session, dataset_id: str, current_user: User) -> DatasetRegistry:
     """Load dataset metadata record by dataset_id."""
     try:
         record = (
@@ -34,13 +35,19 @@ def _get_dataset_record(db: Session, dataset_id: str) -> DatasetRegistry:
 
     if not record:
         raise HTTPException(status_code=404, detail="Dataset not found.")
+    if record.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="You are not authorized to access this dataset.")
     return record
 
 
 @router.post("/query/sql/execute")
-def execute_sql(payload: SQLExecuteRequest, db: Session = Depends(get_db)):
+def execute_sql(
+    payload: SQLExecuteRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Validate and execute a safe SQL query for the selected dataset."""
-    record = _get_dataset_record(db, payload.dataset_id)
+    record = _get_dataset_record(db, payload.dataset_id, current_user)
 
     validated_sql = validate_sql_read_only(payload.sql)
 
@@ -71,9 +78,13 @@ def execute_sql(payload: SQLExecuteRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/query/nl-to-sql", response_model=NLToSQLResponse)
-def nl_to_sql(payload: NLToSQLRequest, db: Session = Depends(get_db)):
+def nl_to_sql(
+    payload: NLToSQLRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Convert natural language question to safe SQL for selected dataset."""
-    record = _get_dataset_record(db, payload.dataset_id)
+    record = _get_dataset_record(db, payload.dataset_id, current_user)
 
     try:
         value_hints = extract_value_hints(
@@ -140,9 +151,13 @@ def nl_to_sql(payload: NLToSQLRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/query/nl-to-tables/execute", response_model=NLToSQLExecuteResponse)
-def nl_to_sql_execute(payload: NLToSQLRequest, db: Session = Depends(get_db)):
+def nl_to_sql_execute(
+    payload: NLToSQLRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Generate safe SQL from NL question and execute it."""
-    record = _get_dataset_record(db, payload.dataset_id)
+    record = _get_dataset_record(db, payload.dataset_id, current_user)
 
     try:
         value_hints = extract_value_hints(

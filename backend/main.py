@@ -8,9 +8,14 @@ from fastapi.exceptions import RequestValidationError
 
 import models
 from database import Base, engine
+from routes.auth import router as auth_router
 from routes.datasets import router as datasets_router
 from routes.query import router as query_router
 from services.api_errors import build_error_response
+from services.schema_migration_service import (
+    count_orphan_datasets,
+    ensure_dataset_registry_user_id_column,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,8 +29,9 @@ app = FastAPI(title="AI Data Analyst API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://172.16.20.29:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -37,6 +43,13 @@ app.add_middleware(
 def on_startup():
     """Create metadata tables at app startup if they do not exist."""
     Base.metadata.create_all(bind=engine)
+    ensure_dataset_registry_user_id_column()
+    orphan_count = count_orphan_datasets()
+    if orphan_count > 0:
+        logger.warning(
+            "Found %s dataset rows with NULL user_id. Backfill is required for ownership.",
+            orphan_count,
+        )
 
 
 @app.middleware("http")
@@ -120,6 +133,7 @@ def health_check():
 
 app.include_router(datasets_router)
 app.include_router(query_router)
+app.include_router(auth_router)
 
 
 
